@@ -66,7 +66,8 @@ class ServiceRouter:
     def register_device(self, device_id: str, device_name: str,
                         entity_list: list, model: str = "",
                         manufacturer: str = "",
-                        reuse_sn: str = None) -> Optional[VirtualDevice]:
+                        reuse_sn: str = None,
+                        entity_override: Optional[dict] = None) -> Optional[VirtualDevice]:
         """注册一个 HA device 到服务路由中
 
         执行以下步骤：
@@ -83,6 +84,8 @@ class ServiceRouter:
             model: device model
             manufacturer: device manufacturer
             reuse_sn: 如果提供，复用此 SN 而非重新生成（用于设备更新场景）
+            entity_override: 用户在「实体管理」中配置的 service→entity 覆盖映射，
+                {service_id: entity_id 或 None}（None 表示该 service 不启用）
 
         Returns:
             创建的 VirtualDevice，如果注册失败返回 None
@@ -125,7 +128,8 @@ class ServiceRouter:
         vd = VirtualDevice(sn=sn, product=product, ha_device_id=device_id)
 
         # 4. 建立 service → entity 映射
-        mapping_count = self._build_service_mapping(vd, product, entity_list)
+        mapping_count = self._build_service_mapping(vd, product, entity_list,
+                                                    entity_override)
 
         if mapping_count == 0:
             _LOGGER.warning(f"Device {device_id}: product {product.pid} matched, "
@@ -144,13 +148,16 @@ class ServiceRouter:
         return vd
 
     def _build_service_mapping(self, vd: VirtualDevice, product: ProductDef,
-                                entity_list: list) -> int:
+                                entity_list: list,
+                                entity_override: Optional[dict] = None) -> int:
         """根据 ProductDef 的 service 定义，将 entity 映射到 service
 
         Args:
             vd: VirtualDevice
             product: 产品定义
             entity_list: entity 列表
+            entity_override: 用户覆盖映射 {service_id: entity_id 或 None}，
+                None 值表示该 service 不启用；未包含的 service 走自动匹配
 
         Returns:
             成功建立的映射数量
@@ -158,6 +165,26 @@ class ServiceRouter:
         mapping_count = 0
 
         for svc_id, svc_def in product.services.items():
+            # 用户覆盖（options flow 实体管理）
+            if entity_override is not None and svc_id in entity_override:
+                chosen = entity_override[svc_id]
+                if not chosen:
+                    _LOGGER.debug(f"  Service '{svc_id}': disabled by user override")
+                    continue
+                ent = next((e for e in entity_list if e["entity_id"] == chosen), None)
+                if ent is not None:
+                    entry = ServiceEntry(
+                        entity_id=ent["entity_id"],
+                        domain=ent.get("domain", ""),
+                        service_name=svc_id
+                    )
+                    vd.add_service_entry(svc_id, entry)
+                    mapping_count += 1
+                    _LOGGER.debug(f"  Service '{svc_id}' -> entity '{chosen}' (user override)")
+                    continue
+                _LOGGER.warning(f"  Service '{svc_id}': override entity '{chosen}' "
+                                f"not found, fallback to auto-match")
+
             # 根据 ServiceDef.ha_mapping 的 domain 来匹配 entity
             best_entity = self._find_best_entity(svc_def, entity_list)
             if best_entity is not None:

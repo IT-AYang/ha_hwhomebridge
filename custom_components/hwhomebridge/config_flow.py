@@ -18,8 +18,10 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import selector
 
-from .const import DOMAIN
+from .const import DOMAIN, SKIP_PLATFORMS
 from .pin_manager import PINManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -250,6 +252,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     _create_bridge_device_entry_async(vd, name, model, manufacturer)
                     _LOGGER.info(f"Device registered via options flow: sn={vd.sn}")
             
+            if selected_sns:
+                # 进入实体管理：为每个选中设备配置 service→entity 映射
+                return await self.async_step_entity_map(selected_sns=sorted(selected_sns))
             return self.async_create_entry(title="", data={})
         
         # 显示设备选择表单
@@ -261,6 +266,121 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             description_placeholders={"device_count": str(len(all_vds))},
         )
     
+    def _entity_map_form(self, selected_sns):
+        """构建实体映射表单：返回 (schema_items, key_map, legend)
+
+        schema_items: {key: SelectSelector}
+        key_map:      {key: (sn, svc_id, default_entity)}
+        """
+        from .hwbridge import service_router
+
+        ent_reg = er.async_get(self.hass)
+        dev_reg = dr.async_get(self.hass)
+        sn_manager = service_router.sn_manager
+
+        schema_items = {}
+        key_map = {}
+        legend = []
+        used_names = set()
+        for sn in selected_sns:
+            vd = sn_manager.get_by_sn(sn)
+            if vd is None:
+                continue
+            dev = dev_reg.async_get(vd.ha_device_id)
+            dev_name = ((dev.name_by_user or dev.name) if dev is not None
+                        else None) or (vd.product.name if vd.product
+                                       else None) or sn
+            base = dev_name
+            if base in used_names:
+                dev_name = f"{base} ({sn[:6]})"
+            used_names.add(base)
+
+            entities = [
+                ent for ent in ent_reg.entities_for_device(vd.ha_device_id)
+                if getattr(ent, "platform", None) not in SKIP_PLATFORMS
+            ]
+            candidates = sorted(ent.entity_id for ent in entities)
+            legend.append(f"{dev_name}：{', '.join(candidates) or '（无实体）'}")
+            for svc_id, svc_def in (vd.product.services or {}).items():
+                key = f"{dev_name} · {svc_id}"
+                key_map[key] = (sn, svc_id)
+                schema_items[key] = selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": "__disable__", "name": "（不映射）"}
+                        ] + [
+                            {"value": eid, "name": eid}
+                            for eid in candidates
+                        ],
+                        mode=selector.SelectMode.DROPDOWN,
+                        custom_value=False,
+                    )
+                )
+        return schema_items, key_map, legend
+
+    async def async_step_entity_map(self, user_input=None, selected_sns=None):
+        """实体管理：为每个选中设备选择 service→entity 映射
+
+        一个 HA 设备（如两按键开关）可能包含多个同类型实体，
+        默认自动映射只取一个。此步骤允许为产品的每个服务
+        指定具体实体，或选择"不映射"禁用该服务。
+
+        保存后受影响设备立即重新注册并同步状态，
+        华为智慧生活APP按新映射显示对应实体。
+        """
+        from .hwbridge import service_router, refresh_bridge_device
+
+        if service_router is None:
+            return self.async_abort(reason="integration_not_init")
+
+        if user_input is None:
+            schema_items, key_map, legend = self._entity_map_form(selected_sns)
+            if not schema_items:
+                return self.async_create_entry(title="")
+            schema = {}
+            for key, sel in schema_items.items():
+                sn, svc_id = key_map[key]
+                vd = service_router.sn_manager.get_by_sn(sn)
+                cur = vd.service_entries.get(svc_id)
+                schema[vol.Required(key, default=(
+                    cur.entity_id if cur else "__disable__"))] = sel
+            return self.async_show_form(
+                step_id="entity_map",
+                data_schema=vol.Schema(schema),
+                description_placeholders={
+                    "legend": "\n\n".join(legend) if legend
+                              else "（无选中设备）",
+                },
+            )
+
+        # 用户提交：解析、持久化、重新注册受影响设备
+        schema_items, key_map, _ = self._entity_map_form(selected_sns)
+        existing = dict(self.config_entry.data.get("entity_map") or {})
+        changed_devices = []
+        for key, (sn, svc_id) in key_map.items():
+            vd = service_router.sn_manager.get_by_sn(sn)
+            if vd is None:
+                continue
+            dev_id = vd.ha_device_id
+            val = user_input.get(key)
+            val = None if val == "__disable__" else val
+            em = existing.setdefault(dev_id, {})
+            if em.get(svc_id) != val:
+                em[svc_id] = val
+                if dev_id not in changed_devices:
+                    changed_devices.append(dev_id)
+
+        if changed_devices:
+            data = dict(self.config_entry.data)
+            data["entity_map"] = existing
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, data=data)
+            for dev_id in changed_devices:
+                _LOGGER.info(f"Re-registering device with new entity map: {dev_id}")
+                refresh_bridge_device(dev_id)
+
+        return self.async_create_entry(title="")
+
     async def _wait_for_binding(self, pin_code: int):
         """后台任务：等待用户在APP上完成绑定"""
         start_time = time.time()

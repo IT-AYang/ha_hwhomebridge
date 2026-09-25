@@ -713,7 +713,54 @@ def _discover_and_register_devices(hass: HomeAssistant):
                  f"{skipped_count} skipped")
 
 
-def _register_single_device(device_id: str, reuse_sn: str = None, is_update: bool = False) -> bool:
+
+def _get_entity_override(device_id: str):
+    """读取用户在 options flow（实体管理）中配置的 service→entity 映射
+
+    存储位置：config entry data 的 "entity_map" 字段，结构：
+        {device_id: {service_id: entity_id 或 None}}
+    """
+    if ghass is None:
+        return None
+    try:
+        entries = ghass.config_entries.async_entries(DOMAIN)
+        for entry in entries:
+            em = entry.data.get("entity_map")
+            if em and device_id in em:
+                return em[device_id]
+    except Exception as e:
+        _LOGGER.warning(f"_get_entity_override failed: {e}")
+    return None
+
+
+def refresh_bridge_device(device_id: str) -> bool:
+    """用户修改实体映射后重新注册该桥接设备
+
+    复用原 SN 注销并重新注册（自动带上 entity_map 覆盖），
+    随后把最新状态同步到 C 侧，智慧生活 APP 立即反映新映射。
+    """
+    if service_router is None or ghass is None:
+        return False
+    vd = service_router.sn_manager.get_by_device_id(device_id)
+    if vd is None:
+        _LOGGER.debug(f"refresh_bridge_device: {device_id} not registered, skip")
+        return False
+    sn = vd.sn
+    if _register_single_device(device_id, reuse_sn=sn, is_update=True):
+        # 同步最新实体状态到 C 侧，智慧生活APP立即反映新映射
+        new_vd = service_router.sn_manager.get_by_device_id(device_id)
+        if new_vd is not None and new_vd.online:
+            service_router.sync_device_state(new_vd)
+        return True
+    # 所有服务被禁用导致无法建立映射：从 C 侧下线该设备
+    service_router.register_device_to_hilink(sn, 2)
+    _LOGGER.info(f"refresh_bridge_device: {device_id} (sn={sn}) deregistered "
+                 f"(all services disabled)")
+    return False
+
+
+def _register_single_device(device_id: str, reuse_sn: str = None, is_update: bool = False,
+                            entity_override: dict = None) -> bool:
     """注册单个设备到 HiLink
     
     从 HA 的 device_registry 和 entity_registry 收集设备信息，
@@ -733,7 +780,11 @@ def _register_single_device(device_id: str, reuse_sn: str = None, is_update: boo
     
     if ghass is None:
         return False
-    
+
+    # 用户配置的实体映射（options flow）：未显式传入时从 config entry data 读取
+    if entity_override is None:
+        entity_override = _get_entity_override(device_id)
+
     # 防重复注册：如果设备已注册且不是更新场景，跳过
     if not is_update and device_id in registered_device_ids:
         _LOGGER.debug(f"Device {device_id} already registered, skip")
@@ -799,7 +850,8 @@ def _register_single_device(device_id: str, reuse_sn: str = None, is_update: boo
         entity_list=entity_list,
         model=model,
         manufacturer=manufacturer,
-        reuse_sn=reuse_sn
+        reuse_sn=reuse_sn,
+        entity_override=entity_override
     )
 
     if vd is not None:
